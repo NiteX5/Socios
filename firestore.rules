@@ -1,0 +1,158 @@
+rules_version = '2';
+
+// SocioIndice - reglas de Firestore (deny por defecto).
+// Autoridad real de seguridad: el cliente es solo UX.
+//
+// Convenciones (fijadas por el arquitecto):
+//   socios/{id}   -> datos del socio
+//   unicos/{key}  -> reservas de unicidad: rut_<rut normalizado> | num_<numeroSocio en minusculas>
+//   admins/{uid}  -> creado manualmente en la consola; el cliente nunca escribe
+//
+// Limites de Firestore Rules (doc oficial "Security Rules: usage and limits"):
+//   - max 10 llamadas exists/get/getAfter/existsAfter por peticion de un solo documento
+//   - max 20 en peticiones multi-documento (batch / transaccion); los accesos repetidos
+//     al mismo documento se cachean y no cuentan dos veces.
+//   - Esta rule-set usa como maximo ~8 documentos distintos por operacion de escritura.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------- helpers ----------
+    function isAdmin() {
+      return request.auth != null
+        && exists(/databases/$(database)/documents/admins/$(request.auth.uid));
+    }
+
+    function rutRegex() { return '^[0-9]{7,8}-[0-9K]$'; }
+    // numeroSocio ya viene recortado; la clave de reserva usa su version en minusculas.
+    function numRegex() { return '^[A-Za-z0-9._-]{1,20}$'; }
+
+    function rutKeyPath(rut) {
+      return /databases/$(database)/documents/unicos/$('rut_' + rut);
+    }
+    function numKeyPath(num) {
+      return /databases/$(database)/documents/unicos/$('num_' + num.lower());
+    }
+
+    // Forma y tipos de un documento de socio (estado final).
+    function validSocioShape(d) {
+      return d.keys().hasAll(['numeroSocio', 'rut', 'nombreCompleto', 'fechaIngreso', 'estado',
+                              'paginaLibro', 'createdAt', 'updatedAt', 'busqueda'])
+        && d.keys().hasOnly(['numeroSocio', 'rut', 'nombreCompleto', 'fechaIngreso', 'estado',
+                             'paginaLibro', 'lugarVotacion', 'observacion', 'fechaRetiro',
+                             'createdAt', 'updatedAt', 'busqueda'])
+        && d.numeroSocio is string && d.numeroSocio.matches(numRegex())
+        && d.rut is string && d.rut.size() <= 12
+        && d.nombreCompleto is string && d.nombreCompleto.size() >= 1 && d.nombreCompleto.size() <= 200
+        && d.fechaIngreso is timestamp
+        && d.estado in ['ACTIVO', 'RETIRADO']
+        && d.paginaLibro is int && d.paginaLibro > 0 && d.paginaLibro <= 1000000
+        && (d.get('lugarVotacion', null) == null
+            || (d.lugarVotacion is string && d.lugarVotacion.size() <= 200))
+        && (d.get('observacion', null) == null
+            || (d.observacion is string && d.observacion.size() <= 500))
+        && d.createdAt is timestamp
+        && d.updatedAt is timestamp
+        && d.busqueda is string && d.busqueda.size() <= 600;
+    }
+
+    // Formato estricto del RUT. Los socios migrados pueden tener rut '' (sin RUT o ilegible):
+    // en update solo se tolera si el RUT no cambia.
+    function rutFormatoOk(d) {
+      return d.rut.matches(rutRegex());
+    }
+
+    // estado <-> fechaRetiro coherentes
+    function validEstado(d) {
+      return (d.estado == 'ACTIVO' && d.get('fechaRetiro', null) == null)
+        || (d.estado == 'RETIRADO' && d.get('fechaRetiro', null) is timestamp);
+    }
+
+    // Las dos reservas existen tras el commit y apuntan a este socio.
+    function reservasOk(id, d) {
+      return existsAfter(rutKeyPath(d.rut))
+        && getAfter(rutKeyPath(d.rut)).data.socioId == id
+        && existsAfter(numKeyPath(d.numeroSocio))
+        && getAfter(numKeyPath(d.numeroSocio)).data.socioId == id;
+    }
+
+    // En update, el RUT solo debe estar reservado si cambia (un socio migrado puede compartir RUT
+    // con otro o no tenerlo; la reserva, si existe, es del otro). El numero siempre se reserva.
+    function reservasOkUpdate(id, before, after) {
+      return (before.rut == after.rut
+              || (existsAfter(rutKeyPath(after.rut))
+                  && getAfter(rutKeyPath(after.rut)).data.socioId == id))
+        && existsAfter(numKeyPath(after.numeroSocio))
+        && getAfter(numKeyPath(after.numeroSocio)).data.socioId == id;
+    }
+
+    // Si cambia rut/numero, la reserva vieja propia debe desaparecer en el mismo commit.
+    function reservasViejasLiberadas(id, before, after) {
+      return (before.rut == after.rut
+              || !(existsAfter(rutKeyPath(before.rut))
+                   && getAfter(rutKeyPath(before.rut)).data.socioId == id))
+        && (before.numeroSocio.lower() == after.numeroSocio.lower()
+            || !existsAfter(numKeyPath(before.numeroSocio)));
+    }
+
+    // ---------- admins ----------
+    match /admins/{uid} {
+      // Un usuario solo puede comprobar su propio documento (para el guard de UX). Sin list.
+      allow get: if request.auth != null && request.auth.uid == uid;
+      allow list, create, update, delete: if false;
+    }
+
+    // ---------- socios ----------
+    match /socios/{socioId} {
+      allow get, list: if isAdmin();
+
+      allow create: if isAdmin()
+        && validSocioShape(request.resource.data)
+        && validEstado(request.resource.data)
+        && rutFormatoOk(request.resource.data)
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.updatedAt == request.time
+        && reservasOk(socioId, request.resource.data);
+
+      allow update: if isAdmin()
+        && validSocioShape(request.resource.data)
+        && validEstado(request.resource.data)
+        && (request.resource.data.rut == resource.data.rut || rutFormatoOk(request.resource.data))
+        && request.resource.data.createdAt == resource.data.createdAt
+        && request.resource.data.updatedAt == request.time
+        && reservasOkUpdate(socioId, resource.data, request.resource.data)
+        && reservasViejasLiberadas(socioId, resource.data, request.resource.data);
+
+      allow delete: if false;
+    }
+
+    // ---------- unicos (reservas) ----------
+    match /unicos/{key} {
+      allow get, list: if isAdmin();
+
+      // Solo se crea junto al socio dueno, que debe existir tras el commit y poseer
+      // exactamente esa clave. Una reserva ya existente no se puede pisar (seria update).
+      allow create: if isAdmin()
+        && request.resource.data.keys().hasOnly(['socioId'])
+        && request.resource.data.socioId is string
+        && request.resource.data.socioId.size() > 0
+        && request.resource.data.socioId.size() <= 128
+        && existsAfter(/databases/$(database)/documents/socios/$(request.resource.data.socioId))
+        && (key == 'rut_' + getAfter(/databases/$(database)/documents/socios/$(request.resource.data.socioId)).data.rut
+            || key == 'num_' + getAfter(/databases/$(database)/documents/socios/$(request.resource.data.socioId)).data.numeroSocio.lower());
+
+      allow update: if false;
+
+      // Solo se libera si el socio dueno sigue existiendo y ya no posee esa clave
+      // (cambio de rut/numero en el mismo commit).
+      allow delete: if isAdmin()
+        && existsAfter(/databases/$(database)/documents/socios/$(resource.data.socioId))
+        && key != 'rut_' + getAfter(/databases/$(database)/documents/socios/$(resource.data.socioId)).data.rut
+        && key != 'num_' + getAfter(/databases/$(database)/documents/socios/$(resource.data.socioId)).data.numeroSocio.lower();
+    }
+
+    // ---------- todo lo demas: denegado ----------
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
