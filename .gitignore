@@ -17,4 +17,4 @@ next-env.d.ts
 *.tsbuildinfo
 seeds/reporte-migracion.json
 seeds/*.csv
-.claude/settings.local.json
+.claude/
